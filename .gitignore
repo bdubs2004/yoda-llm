@@ -1,0 +1,20 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+
+# data & models (do NOT commit large weights)
+data/
+models/
+*.ckpt
+*.pt
+*.bin
+overnight.log
+
+# VS Code
+.vscode/
+
+# secrets
+.env
