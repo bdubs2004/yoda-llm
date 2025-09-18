@@ -1,0 +1,15 @@
+transformers>=4.31
+accelerate
+bitsandbytes
+peft
+datasets
+sentence-transformers
+faiss-cpu
+langchain
+chromadb
+tqdm
+pdfplumber
+gradio
+huggingface-hub
+PyMuPDF
+python-docx
