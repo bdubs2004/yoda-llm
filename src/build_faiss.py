@@ -1,5 +1,5 @@
 
-#This script reads your processed Star Wars/Yoda text chunks
+#This script reads the processed Star Wars/Yoda text chunks
 #and builds a FAISS vector store for retrieval-augmented generation (RAG).
 
 # ==========================
@@ -66,9 +66,27 @@ print("Adding embeddings to FAISS index...")
 index.add(embeddings)
 
 # ==========================
+#MetaData saving
+# ==========================
+metadata = []
+for i, chunk in enumerate(chunks):
+    metadata.append({
+        "id": i,
+        "text": chunk
+    })
+
+# Save metadata to processed folder
+os.makedirs("processed", exist_ok=True)
+with open(os.path.join("processed", "chunk_metadata.json"), "w", encoding="utf-8") as f:
+    json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+print("Saved chunk metadata to processed/chunk_metadata.json")
+
+# ==========================
 #Save index to disk
 # ==========================
 print(f"Saving FAISS index to {FAISS_INDEX_PATH}...")
 faiss.write_index(index, str(FAISS_INDEX_PATH))
 
 print("FAISS index built and saved successfully!")
+
