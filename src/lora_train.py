@@ -1,175 +1,172 @@
-# LoRA fine-tuning skeleton (PEFT) for a causal LLM (Phi-2 in this example).
-import os
+# lora_train.py
 import json
-from pathlib import Path
-import torch
-from datasets import load_dataset
+from datasets import Dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    TrainingArguments,
     Trainer,
-    DataCollatorForLanguageModeling,
-    BitsAndBytesConfig
+    TrainingArguments,
+    BitsAndBytesConfig,
+    default_data_collator,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    TaskType,
+    prepare_model_for_kbit_training,
+)
+import torch
 
-# ----------------------------
-# Config
-# ----------------------------
+# -------------------------------
+#Helper function to list model modules
+# -------------------------------
+def list_model_module_names(model, max_lines=200):
+    """
+    Prints the first N module names (module path strings) from the model.
+    Use these strings (or substrings) to choose `target_modules` for LoRA.
+    """
+    print("\n[DEBUG] Listing model modules (first {} lines):".format(max_lines))
+    count = 0
+    for name, _ in model.named_modules():
+        print(name)
+        count += 1
+        if count >= max_lines:
+            break
+    print("[DEBUG] end module list\n")
+
+
+# -------------------------------
+#Load JSON dataset
+# -------------------------------
+with open("yoda_dataset.json", "r") as f:
+    data_list = json.load(f)
+
+# Convert to Hugging Face Dataset
+dataset = Dataset.from_list(data_list)
+
+# -------------------------------
+#Format prompts
+# -------------------------------
+def format_prompt(example):
+    instruction = example.get("instruction", "").strip()
+    input_text = example.get("input", "").strip()
+    output_text = example.get("output", "").strip()
+
+    if input_text:
+        prompt = f"Instruction: {instruction}\nInput: {input_text}\nResponse:"
+    else:
+        prompt = f"Instruction: {instruction}\nResponse:"
+
+    return {"prompt": prompt, "response": output_text}
+
+dataset = dataset.map(format_prompt)
+
+# -------------------------------
+#Load tokenizer and model
+# -------------------------------
 MODEL_NAME = "microsoft/phi-2"
-DATA_FILE = "../yoda_dataset.json"       
-OUTPUT_DIR = "../models/phi2-yoda-lora"  
-MAX_LENGTH = 512                         
-MAX_STEPS = 800                          
-LEARNING_RATE = 2e-4
-PER_DEVICE_BATCH_SIZE = 1         
-GRAD_ACCUM_STEPS = 8
-FP16 = True
+print(f"[INFO] Using base model: {MODEL_NAME}")
 
-# LoRA hyperparams
-LORA_R = 8
-LORA_ALPHA = 16
-LORA_DROPOUT = 0.05
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token = tokenizer.eos_token
 
-# ----------------------------
-#Safety checks / create dirs
-# ----------------------------
-os.makedirs(Path(OUTPUT_DIR).parent, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# ----------------------------
-#Load tokenizer
-# ----------------------------
-print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-
-#Phi-2 does not have a pad token by default; we set it to eos_token
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
-
-# ----------------------------
-#Quantization config + model load
-# ----------------------------
-#Using BitsAndBytesConfig
+# Load model with 4-bit quantization
 bnb_config = BitsAndBytesConfig(
     load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_compute_dtype="float16",
     bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4"
+    bnb_4bit_quant_type="nf4",
 )
 
-print("Loading model in 4-bit (this may take a minute)...")
-# Model load with quantization config
+print("[INFO] Loading model with 4-bit quantization (may take a minute)...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
+    device_map="auto",
     quantization_config=bnb_config,
-    device_map="auto"
+    low_cpu_mem_usage=True
 )
 
-# Prepare model for k-bit training
-print("Preparing model for k-bit (PEFT) training...")
-model = prepare_model_for_kbit_training(model)
-
-# ----------------------------
-#Create and attach LoRA adapter
-# ----------------------------
-print("Attaching LoRA adapter...")
-lora_config = LoraConfig(
-    r=LORA_R,
-    lora_alpha=LORA_ALPHA,
-    target_modules=["q_proj", "v_proj"],
-    lora_dropout=LORA_DROPOUT,
-    bias="none",
-    task_type="CAUSAL_LM"
-)
-model = get_peft_model(model, lora_config)
-
-# ----------------------------
-# Load dataset
-# ----------------------------
-# We'll transform each example into a single training
-print(f"Loading dataset from {DATA_FILE} ...")
-if not Path(DATA_FILE).exists():
-    raise FileNotFoundError(f"{DATA_FILE} not found. Create a small yoda_dataset.json first.")
-
-raw_ds = load_dataset("json", data_files=DATA_FILE)
-
-# Convert examples into single text prompt
-def make_training_text(example):
-    instruction = example.get("instruction", "").strip()
-    inp = example.get("input", "").strip()
-    out = example.get("output", "").strip()
-
-    # The model will learn to map the "prompt" section -> "response"
-    text = f"### Instruction:\n{instruction}\n\n### Input:\n{inp}\n\n### Response:\n{out}\n"
-    return text
-
-def preprocess_examples(batch):
-    #Batch is a dict with keys "instruction", "input", "output"
-    texts = [make_training_text(x) for x in batch["data"]]
-    tokenized = tokenizer(texts, padding="max_length", truncation=True, max_length=MAX_LENGTH)
-    tokenized["labels"] = tokenized["input_ids"].copy()
+# -------------------------------
+#Tokenize dataset
+# -------------------------------
+def tokenize(example):
+    full_prompt = example["prompt"] + " " + example["response"]
+    tokenized = tokenizer(
+        full_prompt,
+        truncation=True,
+        max_length=512,
+        padding="max_length"
+    )
+    tokenized["labels"] = [
+        t if t != tokenizer.pad_token_id else -100 for t in tokenized["input_ids"]
+    ]
     return tokenized
 
-# Map function to create "text" field
-def map_to_text(example):
-    return {"text": make_training_text(example)}
+tokenized_dataset = dataset.map(tokenize, batched=False)
 
-# Create a dataset where each item contains the "text"
-ds = raw_ds["train"].map(map_to_text)
+# -------------------------------
+#Set up LoRA
+# -------------------------------
+# Prepare model for k-bit training
+model = prepare_model_for_kbit_training(model)
 
-#Tokenize the dataset
-def tokenize_fn(ex):
-    out = tokenizer(ex["text"], truncation=True, max_length=MAX_LENGTH, padding="max_length")
-    out["labels"] = out["input_ids"].copy()
-    return out
-
-tokenized_ds = ds.map(tokenize_fn, batched=False, remove_columns=["text"])
-
-# ----------------------------
-#Data collator
-# ----------------------------
-data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-# ----------------------------
-#Training arguments
-# ----------------------------
-training_args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
-    per_device_train_batch_size=PER_DEVICE_BATCH_SIZE,
-    gradient_accumulation_steps=GRAD_ACCUM_STEPS,
-    learning_rate=LEARNING_RATE,
-    max_steps=MAX_STEPS,
-    warmup_steps=50,
-    fp16=FP16,
-    logging_steps=20,
-    save_steps=200,
-    save_total_limit=3,
-    remove_unused_columns=False,
-    report_to="none"
+# LoRA configuration
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "Wq", "Wqkv", "q", "kv", "o", "gate_proj",
+        "down_proj", "up_proj", "fc1", "fc2", "dense"
+    ],
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM,
 )
 
-# ----------------------------
+print("[INFO] Applying LoRA adapters (this will inspect model module names)...")
+model = get_peft_model(model, lora_config)
+
+# -------------------------------
+#Data collator
+# -------------------------------
+data_collator = default_data_collator
+
+# -------------------------------
+#Training arguments
+# -------------------------------
+training_args = TrainingArguments(
+    output_dir="./lora_starwars",
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    learning_rate=3e-4,
+    num_train_epochs=3,
+    logging_steps=10,
+    save_strategy="steps",
+    save_steps=50,
+    save_total_limit=6,
+    fp16=True,
+    optim="paged_adamw_32bit",
+)
+
+# -------------------------------
 #Trainer
-# ----------------------------
+# -------------------------------
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_ds,
+    train_dataset=tokenized_dataset,
+    tokenizer=tokenizer,
     data_collator=data_collator,
 )
 
-# ----------------------------
-#Training
-# ----------------------------
-print("Starting training... (this may run overnight based on max_steps)")
+# -------------------------------
+#Start training
+# -------------------------------
 trainer.train()
 
-# ----------------------------
-#Save the LoRA adapter and push
-# ----------------------------
-print(f"Saving LoRA adapter to {OUTPUT_DIR} ...")
-model.save_pretrained(OUTPUT_DIR)
-
-print("Done. You can now load the adapter with `AutoModelForCausalLM.from_pretrained(base_model).merge_and_unload()` or use PEFT to load the adapter at inference time.")
+# -------------------------------
+#Save LoRA weights
+# -------------------------------
+model.save_pretrained("./lora_starwars")
