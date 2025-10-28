@@ -2,41 +2,57 @@
 from flask import Flask, render_template_string, request, jsonify
 import os
 from typing import List, Tuple
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 
 app = Flask(__name__)
 
 # --------------------
-# Backend configuration
+# Load LoRA fine-tuned model
 # --------------------
-BACKEND = os.environ.get("BACKEND", "mock")  # "mock" just for demonstration
+MODEL_NAME = "microsoft/phi-2"
+LORA_PATH = "./lora_starwars"  # Folder containing adapter_model.safetensors
+
+print("[INFO] Loading tokenizer and model...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+tokenizer.pad_token = tokenizer.eos_token
+
+base_model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto",
+    low_cpu_mem_usage=True
+)
+
+model = PeftModel.from_pretrained(base_model, LORA_PATH)
+model.eval()
 
 # --------------------
-# Yoda function (mock)
-# --------------------
-def yodaize_simple(text: str) -> str:
-    text = text.strip()
-    if not text:
-        return "Say something, you must."
-    parts = [p.strip() for p in text.replace(" and ", ", ").split(",")]
-    if len(parts) > 1:
-        new_order = parts[-1:] + parts[:-1]
-        out = ", ".join(new_order)
-    else:
-        words = text.split()
-        if len(words) > 3:
-            out = " ".join(words[2:] + words[:2])
-        else:
-            out = " ".join(words[::-1])
-    return f"{out}, hmmm. Wise this is."
-
-# --------------------
-# Unified response
+# Unified response using LoRA model
 # --------------------
 def get_response(user_message: str, side: str) -> str:
-    reply = yodaize_simple(user_message)
+    prompt = f"Instruction: {user_message}\nResponse:"
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
+
+    outputs = model.generate(
+        **inputs,
+        max_new_tokens=100,
+        temperature=0.7,
+        top_p=0.9,
+        do_sample=True
+    )
+
+    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    if "Response:" in response:
+        response = response.split("Response:")[-1].strip()
+
     if side == "Sith":
-        reply = reply.replace("hmmm", "grr...").replace("Wise", "Dark")
-    return reply
+        response = response.replace("hmmm", "grr...").replace("Wise", "Dark")
+
+    return response
+
 
 # --------------------
 # HTML Template with Dual Lightsaber Animation
@@ -233,7 +249,6 @@ sideSelect.addEventListener('change',function(){
     });
 });
 
-
 // Run lightsaber animation once on page load
 window.addEventListener('DOMContentLoaded', () => {
     animateLightsabers();
@@ -242,7 +257,6 @@ window.addEventListener('DOMContentLoaded', () => {
 </body>
 </html>
 """
-
 
 # --------------------
 # Routes
