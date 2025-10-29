@@ -1,61 +1,88 @@
-# Import necessary libraries
+# app.py
 from flask import Flask, render_template_string, request, jsonify
+import sys
 import os
-from typing import List, Tuple
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel
+import re
+
+# Add src folder to Python path
+SRC_DIR = os.path.join(os.path.dirname(__file__), "../src")
+sys.path.append(SRC_DIR)
+
+# Import functions from your inference module
+from infer import search_faiss, generate_response, tokenizer, device, model
+
 
 app = Flask(__name__)
 
 # --------------------
-# Load LoRA fine-tuned model
-# --------------------
-MODEL_NAME = "microsoft/phi-2"
-LORA_PATH = "./lora_starwars"  # Folder containing adapter_model.safetensors
-
-print("[INFO] Loading tokenizer and model...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-tokenizer.pad_token = tokenizer.eos_token
-
-base_model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-    device_map="auto",
-    low_cpu_mem_usage=True
-)
-
-model = PeftModel.from_pretrained(base_model, LORA_PATH)
-model.eval()
-
-# --------------------
-# Unified response using LoRA model
+# Helper: Build Yoda-style response
 # --------------------
 def get_response(user_message: str, side: str) -> str:
-    prompt = f"Instruction: {user_message}\nResponse:"
-    inputs = tokenizer(prompt, return_tensors="pt").to("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        # Retrieve top 3 context chunks
+        retrieved_chunks = search_faiss(user_message, k=3)
 
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=100,
-        temperature=0.7,
-        top_p=0.9,
-        do_sample=True
-    )
+        # Filter out example lines
+        filtered_chunks = []
+        for chunk in retrieved_chunks:
+            lines = [line for line in chunk.splitlines() if not line.strip().startswith("Exercise:")]
+            filtered_chunks.append(" ".join(lines))
+        context = " ".join(filtered_chunks)
 
-    response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Fallback context
+        if not context.strip():
+            context = "Relevant Star Wars knowledge about Jedi, Sith, lightsabers, and the Force."
 
-    if "Response:" in response:
-        response = response.split("Response:")[-1].strip()
+        # Build prompt with instructions at the top
+        prompt = f"""You are Yoda, a wise Jedi Master.
+Answer in Yoda-style speech.
+Keep it short, concise, and in-character.
+Use ONLY relevant Star Wars knowledge from the context below.
 
-    if side == "Sith":
-        response = response.replace("hmmm", "grr...").replace("Wise", "Dark")
+Context:
+{context}
 
-    return response
+Question: {user_message}
+Answer (Yoda-style):"""
 
+        # Tokenize and generate
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=120,
+            do_sample=True,
+            temperature=0.7,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id
+        )
+        full_output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+        # Extract Yoda answer only
+        if "Answer (Yoda-style):" in full_output:
+            response = full_output.split("Answer (Yoda-style):", 1)[1].strip()
+        else:
+            response = full_output.replace(prompt, '').strip()
+
+        # Keep only first line for concise answer
+        response = response.split("\n")[0].strip()
+        response = response.strip('"')
+
+        # Apply Sith tone
+        if side.lower() == "sith":
+            response = response.replace("Yoda", "Sith Lord").replace("wise", "dark")
+
+        # Safety fallback
+        if not response:
+            response = "Silent, I am. Try again, you must."
+
+        return response
+
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return "Confused, I am. Hmm."
 
 # --------------------
-# HTML Template with Dual Lightsaber Animation
+# HTML Template
 # --------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -129,7 +156,6 @@ body.jedi #send-btn { background:#00ffcc; color:#000; box-shadow:0 0 15px #00ffc
 body.sith #send-btn { background:#ff0044; color:#000; box-shadow:0 0 15px #ff0044; }
 select { padding:10px; border-radius:8px; font-family:'Orbitron',sans-serif; font-size:1em; border:none; background: rgba(0,0,0,0.7); color: inherit; text-shadow:0 0 5px currentColor; }
 
-/* Lightsabers */
 #lightsaber-left, #lightsaber-right {
     position:absolute;
     top:50%;
@@ -138,30 +164,16 @@ select { padding:10px; border-radius:8px; font-family:'Orbitron',sans-serif; fon
     border-radius:10px;
     z-index: 0;
     opacity:0.9;
-    transition: all 1s ease; /* keep normal animation the same */
+    transition: all 1s ease;
 }
 
-/* Jedi/Sith colors + default offscreen */
 #lightsaber-left.jedi { background: linear-gradient(to top,#00ff00,#00ffcc); box-shadow:0 0 30px #00ffcc; left:-200px; transform: translateY(-50%);}
 #lightsaber-right.jedi { background: linear-gradient(to top,#00ff00,#00ffcc); box-shadow:0 0 30px #00ffcc; right:-200px; transform: translateY(-50%);}
 #lightsaber-left.sith { background: linear-gradient(to top,#ff0044,#ff3399); box-shadow:0 0 30px #ff0044; left:-200px; transform: translateY(-50%);}
 #lightsaber-right.sith { background: linear-gradient(to top,#ff0044,#ff3399); box-shadow:0 0 30px #ff0044; right:-200px; transform: translateY(-50%);}
 
-/* Animate to center and back */
 #lightsaber-left.animate { left:50%; transform: translate(-50%,-50%); }
 #lightsaber-right.animate { right:50%; transform: translate(50%,-50%); }
-
-/* Duel X intro (smoother only here) */
-#lightsaber-left.start-x,
-#lightsaber-right.start-x,
-#lightsaber-left.animate-out,
-#lightsaber-right.animate-out {
-    transition: all 1.5s ease-in-out; /* smoother only for the X */
-}
-#lightsaber-left.start-x { left:50%; transform: translate(-50%,-50%) rotate(-45deg); }
-#lightsaber-right.start-x { right:50%; transform: translate(50%,-50%) rotate(45deg); }
-#lightsaber-left.animate-out { left:-200px; transform: translateY(-50%) rotate(0deg); }
-#lightsaber-right.animate-out { right:-200px; transform: translateY(-50%) rotate(0deg); }
 </style>
 </head>
 <body class="jedi">
@@ -200,15 +212,34 @@ async function sendMessage(){
     const message = txt.value.trim();
     if(!message) return;
     const side = sideSelect.value;
-    const res = await fetch('/ask',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({message,side})
-    });
-    const data = await res.json();
-    addMessage('user',message,side);
-    addMessage('bot',data.reply,side);
-    txt.value='';
+
+    // Add user message immediately
+    addMessage('user', message, side);
+
+    // Add thinking placeholder
+    const thinkingDiv = document.createElement('div');
+    thinkingDiv.classList.add('message','bot', side==='Sith'?'sith':'jedi');
+    thinkingDiv.textContent = "Yoda is thinking...";
+    chatbox.appendChild(thinkingDiv);
+    chatbox.scrollTop = chatbox.scrollHeight;
+
+    txt.value='';  // clear input box
+
+    try {
+        const res = await fetch('/ask',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({message,side})
+        });
+        const data = await res.json();
+
+        // Replace placeholder with actual response
+        thinkingDiv.textContent = data.reply;
+
+    } catch(err) {
+        thinkingDiv.textContent = "Confused, I am. Hmm.";
+        console.error(err);
+    }
 }
 
 function animateLightsabers(){
@@ -220,10 +251,10 @@ function animateLightsabers(){
     },1000);
 }
 
-txt.addEventListener('keydown',e=>{ if(e.key==='Enter') sendMessage(); });
-sendBtn.addEventListener('click',sendMessage);
+txt.addEventListener('keydown', e => { if(e.key==='Enter') sendMessage(); });
+sendBtn.addEventListener('click', sendMessage);
 
-sideSelect.addEventListener('change',function(){
+sideSelect.addEventListener('change', function(){
     const side = sideSelect.value;
     document.body.className = side.toLowerCase();
 
@@ -268,8 +299,8 @@ def index():
 @app.route("/ask", methods=["POST"])
 def ask():
     data = request.get_json()
-    message = data.get("message","")
-    side = data.get("side","Jedi")
+    message = data.get("message", "")
+    side = data.get("side", "Jedi")
     reply = get_response(message, side)
     return jsonify({"reply": reply})
 
